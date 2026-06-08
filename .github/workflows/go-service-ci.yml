@@ -1,0 +1,89 @@
+name: Reusable Go Service CI
+
+# Called by other microservice repositories via:
+#   uses: <org>/sample-code/.github/workflows/go-service-ci.yml@main
+on:
+  workflow_call:
+    inputs:
+      registry:
+        description: Container registry hostname
+        type: string
+        default: ghcr.io
+      image-name:
+        description: Full image name (e.g. org/service-name)
+        type: string
+        required: true
+    secrets:
+      registry-token:
+        description: Token for registry login (defaults to GITHUB_TOKEN if not provided)
+        required: false
+
+env:
+  REGISTRY: ${{ inputs.registry }}
+  IMAGE_NAME: ${{ inputs.image-name }}
+
+jobs:
+  lint-and-test:
+    name: Lint & Test
+    runs-on: [self-hosted, linux]
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build test image
+        run: docker build --file Dockerfile.test --tag app:test .
+
+      - name: Run lint and tests
+        run: docker run --rm app:test
+
+      - name: Cleanup test image
+        if: always()
+        run: docker rmi app:test || true
+
+  build:
+    name: Build & Push Docker Image
+    runs-on: [self-hosted, linux]
+    needs: lint-and-test
+    if: github.event_name != 'pull_request'
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.registry-token || secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix={{branch}}-,format=short
+            type=ref,event=branch
+            type=raw,value=latest,enable={{is_default_branch}}
+          flavor: |
+            latest=false
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}

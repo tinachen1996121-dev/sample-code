@@ -1,0 +1,44 @@
+name: Setup Branch Protection
+
+# Run manually via GitHub UI (Actions → Setup Branch Protection → Run workflow)
+# or automatically after the first CI workflow succeeds on main.
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows: ["CI Pipeline"]
+    branches: [main]
+    types: [completed]
+
+jobs:
+  protect:
+    name: Apply Branch Protection Rules
+    runs-on: [self-hosted, linux]
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    permissions:
+      contents: read
+      administration: write
+    steps:
+      - name: Apply main branch protection
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh api \
+            --method PUT \
+            repos/$REPO/branches/main/protection \
+            --input - <<'EOF'
+          {
+            "required_status_checks": {
+              "strict": true,
+              "contexts": ["Lint & Test"]
+            },
+            "enforce_admins": false,
+            "required_pull_request_reviews": {
+              "required_approving_review_count": 1,
+              "dismiss_stale_reviews": true
+            },
+            "restrictions": null,
+            "allow_force_pushes": false,
+            "allow_deletions": false
+          }
+          EOF
