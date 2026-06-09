@@ -1,21 +1,17 @@
-# Simple Go Server - CI Pipeline
-
-A simple Golang web server with an automated CI pipeline designed for enterprise constraints.
+# CI Pipeline Design Plan
 
 ## Overview
 
-| Item | Description |
-|------|-------------|
-| **Application** | Health-check endpoint at `/health` returning `200 OK` |
-| **CI Platform** | GitHub Actions |
-| **Infrastructure** | 5 Build Servers (each running 3+ concurrent jobs) |
-| **Architecture** | Reusable workflows for microservices scalability |
+本文件為 Golang Web Server 專案的 CI Pipeline 設計規劃，基於 `docs/assignment.pdf` 需求撰寫。
+
+**技術選擇**: GitHub Actions  
+**基礎設施限制**: 5 台 Build Servers，每台可能同時運行 3+ 個 jobs
 
 ---
 
 ## CI Pipeline Architecture
 
-### Pipeline Diagram
+### Pipeline Flow Diagram
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -51,33 +47,28 @@ A simple Golang web server with an automated CI pipeline designed for enterprise
 │  • Build Dockerfile.test → docker run                               │
 │  • golangci-lint + unit tests (inside container)                    │
 │  • Timeout: 10 min                                                  │
-└─────────────────────────────────┬───────────────────────────────────┘
-                                  │ Pass
-                                  ▼
-                    ┌─────────────────────────────┐
-                    │  Check Event Type           │
-                    └─────────────┬───────────────┘
-                                  │
-                ┌─────────────────┴─────────────────┐
-                │                                   │
-                ▼                                   ▼
-┌───────────────────────────┐         ┌────────────────────────────────┐
-│  Pull Request             │         │  Push to main                  │
-│  → Stop (no build/push)   │         │  → Continue to Stage 2         │
-└───────────────────────────┘         └───────────────┬────────────────┘
-                                                      │
-                                                      ▼
+└─────────────────────────────┬───────────────────────────────────────┘
+                              │ Pass
+                              ▼
+                ┌─────────────────────────────┐
+                │  Check Event Type           │
+                └─────────────┬───────────────┘
+                              │
+            ┌─────────────────┴─────────────────┐
+            │                                   │
+            ▼                                   ▼
+┌───────────────────────┐         ┌────────────────────────────────┐
+│  Pull Request         │         │  Push to main                  │
+│  → Stop (no push)     │         │  → Continue to Stage 2         │
+└───────────────────────┘         └───────────────┬────────────────┘
+                                                  │
+                                                  ▼
 ┌─────────────────────────────────────────────────────────────────────┐
 │  STAGE 2: BUILD & PUSH                                               │
 │  • Runner: self-hosted linux                                        │
 │  • Multi-stage Dockerfile                                           │
 │  • Push to GitHub Container Registry (ghcr.io)                     │
 │  • Timeout: 15 min                                                  │
-│                                                                      │
-│  Output Tags:                                                        │
-│  • main-abc1234  (Git SHA — immutable)                              │
-│  • main          (branch — mutable)                                 │
-│  • latest        (mutable, main only)                               │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -110,39 +101,22 @@ concurrency:
 
 當開發者 push 新 commits 到同一 PR 時，舊的 build 自動取消，減少 queue 堆積。
 
-**合併到 main 時的行為：**
-
-```
-09:00  PR1 合併 → CI 開始跑 ────╳ 被取消（沒有 push image）
-09:01  PR2 合併 → CI 開始跑 ────→ ✅ 完成，push image
-```
-
-為了在 5 台 server 限制下避免 queue 過長，採用 cancel-in-progress 策略。最新的 commit 優先完成，舊的被取消。這意味著某些快速連續合併的 commit 可能沒有對應的 image，但 **SHA tag 確保每個成功 build 的 image 都可追溯**，需要時可精確 rollback。
-
-| 情境 | 結果 |
-|------|------|
-| 快速連續合併多個 PR | 只有最後一個有 image |
-| 需要 rollback | 使用最近成功 build 的 SHA tag |
-| 一般開發流程 | 最新版本始終可用 |
-
 **Solution C: Aggressive Timeouts**
 
-| Job | Timeout |
-|-----|---------|
-| Lint & Test | 10 min |
-| Build & Push | 15 min |
+- Lint & Test: 10 min
+- Build & Push: 15 min
 
-防止 hung jobs 長時間佔用 runners。
+防止 hung jobs 長時間佔用 runner。
 
 ---
 
 ### 2. Scalability
 
-**Challenge**: Pipeline 需擴展至多個 microservice repositories，避免重複維護
+**Challenge**: Pipeline 需擴展至多個 microservice repositories
 
 **Solution: Reusable Workflow Architecture**
 
-此 repo 的 [`.github/workflows/go-service-ci.yml`](.github/workflows/go-service-ci.yml) 即為中央 reusable workflow，其他 microservice repo 直接 `uses` 它：
+此 repo 的 `.github/workflows/go-service-ci.yml` 即為中央 reusable workflow：
 
 ```
 sample-code/                               ← 此 repo（中央 workflow）
@@ -151,13 +125,13 @@ sample-code/                               ← 此 repo（中央 workflow）
     └── go-service-ci.yml                 ← Reusable workflow（供其他 repos 呼叫）
 
 user-service/                              ← Microservice A
-└── .github/workflows/ci.yml              ← ~15 行，呼叫 reusable workflow
+└── .github/workflows/ci.yml              ← 15 行，呼叫 reusable workflow
 
 order-service/                             ← Microservice B
-└── .github/workflows/ci.yml              ← ~15 行，呼叫 reusable workflow
+└── .github/workflows/ci.yml              ← 15 行，呼叫 reusable workflow
 ```
 
-**每個 Microservice 只需 ~15 行**:
+**Per-Service Implementation (~15 lines)**:
 
 ```yaml
 name: CI
@@ -175,10 +149,9 @@ jobs:
 ```
 
 **Benefits**:
-- **DRY**: CI 邏輯只定義一次，所有 repos 共用
-- **一致性**: 所有 services 使用相同 build process
-- **易維護**: 更新 `go-service-ci.yml`，所有 services 自動套用
-- **快速 onboarding**: 新 service 5 分鐘內加入 CI
+- DRY: CI 邏輯只定義一次
+- 一致性: 所有 services 使用相同 build process
+- 快速 onboarding: 新 service 5 分鐘內加入 CI
 
 ---
 
@@ -188,27 +161,21 @@ jobs:
 
 | Tag Type | Example | Mutable | Use Case |
 |----------|---------|---------|----------|
-| **Git SHA** | `main-abc1234` | ❌ Immutable | Production deployment, rollback |
-| **Branch** | `main` | ✅ Mutable | Auto-deploy to staging |
-| **Latest** | `latest` | ✅ Mutable | Default pull target |
+| **Git SHA** | `main-abc1234` | ❌ | Production, rollback |
+| **Branch** | `main` | ✅ | Auto-deploy environments |
+| **Latest** | `latest` | ✅ | Default pull target |
 
 **Why Git SHA?**
 
 `latest` 和 `main` 是 mutable 的，每次 push 都會被覆蓋，rollback 時無法知道上一個版本指向哪個 commit。Git SHA tag 是 immutable 的，出事時可以精確 rollback 到任意歷史版本。
 
-**Best Practice**:
+**Tagging Logic** (via `docker/metadata-action`):
 
 ```yaml
-# ✅ Production: 使用 immutable tags
-image: ghcr.io/org/service:main-abc1234
-
-# ❌ Production: 避免 mutable tags
-image: ghcr.io/org/service:latest
-```
-
-**Rollback 範例**:
-```bash
-kubectl set image deployment/app container=ghcr.io/org/service:main-def5678
+tags: |
+  type=sha,prefix={{branch}}-,format=short   # main-abc1234
+  type=ref,event=branch                       # main
+  type=raw,value=latest,enable={{is_default_branch}}
 ```
 
 ---
@@ -217,24 +184,21 @@ kubectl set image deployment/app container=ghcr.io/org/service:main-def5678
 
 **Challenge**: 安全管理 registry credentials，不在 code 或 logs 中暴露 secrets
 
-**Solution: GitHub Secrets + Least Privilege**
+**Solution A: GitHub Secrets (GHCR)**
 
 ```yaml
 permissions:
-  contents: read   # 只讀 source code
-  packages: write  # 只寫 container images
+  contents: read
+  packages: write
 
-steps:
-  - uses: docker/login-action@v3
-    with:
-      registry: ghcr.io
-      username: ${{ github.actor }}
-      password: ${{ secrets.GITHUB_TOKEN }}  # Auto-provided, 無需手動設定
+- uses: docker/login-action@v3
+  with:
+    registry: ghcr.io
+    username: ${{ github.actor }}
+    password: ${{ secrets.GITHUB_TOKEN }}  # Auto-provided
 ```
 
-`GITHUB_TOKEN` 由 GitHub 自動產生，每次 workflow run 都是新 token，無 long-lived credentials 風險。
-
-如需推送至雲端 registry（AWS ECR / Azure ACR），建議改用 **OIDC**：
+**Solution B: OIDC (Cloud Registries — AWS ECR / Azure ACR)**
 
 ```yaml
 permissions:
@@ -247,49 +211,36 @@ permissions:
     aws-region: us-east-1
 ```
 
-OIDC 的優勢：無 long-lived credentials、自動 token rotation、細粒度存取控制（per repo/branch）。
+**Benefits**: 無 long-lived credentials，自動 token rotation
+
+**Best Practices**:
+- Least privilege: 每個 job 只給必要 permissions
+- Organization-level secrets 跨 repos 共享
 
 ---
 
 ### 5. Branch Protection
 
-Main branch 需在 GitHub UI（Settings → Branches）手動設定以下 protection rules，確保 CI 通過才能 merge：
+**Solution**: 在 GitHub UI（Settings → Branches）手動設定 main branch protection rules。
 
-- Require status check **"Lint & Test"** to pass before merging
-- Require branches to be up to date before merging
-- Require at least 1 approving PR review
+Rules applied to `main`:
+- Require status check `Lint & Test` to pass before merging (strict)
+- Require 1 approving PR review, dismiss stale reviews on new commits
 - Disable force push and branch deletion
 
 ---
 
-## Quick Start
+## Summary
 
-```bash
-# Run locally
-go run main.go
-curl http://localhost:8080/health  # Returns: OK
-
-# Run tests
-go test -v ./...
-
-# Build with Docker
-docker build -t simple-go-server .
-docker run -p 8080:8080 simple-go-server
-```
+| Design Decision | Solution |
+|-----------------|----------|
+| Resource Contention | Docker isolation + Concurrency control + Timeouts |
+| Scalability | Reusable workflow architecture |
+| Tagging Strategy | SHA + Branch + Latest |
+| Security | GITHUB_TOKEN / OIDC + Least privilege |
+| Branch Protection | GitHub UI — require CI pass + PR review before merge |
 
 ---
 
-## Project Structure
-
-```
-.
-├── .github/workflows/
-│   ├── ci.yml                      # CI pipeline (本 repo)
-│   └── go-service-ci.yml           # Reusable workflow (供其他 repos 呼叫)
-├── Dockerfile                      # Production multi-stage build
-├── Dockerfile.test                 # Testing/linting environment
-├── .golangci.yml                   # Linting configuration
-├── main.go                         # Application code
-├── main_test.go                    # Unit tests
-└── README.md                       # This file
-```
+**Document Version**: 1.1  
+**Last Updated**: 2026-06-08

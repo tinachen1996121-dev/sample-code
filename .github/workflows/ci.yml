@@ -32,14 +32,14 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Build test image
-        run: docker build --file Dockerfile.test --tag app:test .
+        run: docker build --file Dockerfile.test --tag app:test-${{ github.run_id }} .
 
       - name: Run lint and tests
-        run: docker run --rm app:test
+        run: docker run --rm app:test-${{ github.run_id }}
 
       - name: Cleanup test image
         if: always()
-        run: docker rmi app:test || true
+        run: docker rmi app:test-${{ github.run_id }} || true
 
   # Stage 2: Build & Push - only after lint-and-test passes
   build:

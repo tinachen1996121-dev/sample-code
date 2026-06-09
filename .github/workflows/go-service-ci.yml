@@ -35,14 +35,14 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Build test image
-        run: docker build --file Dockerfile.test --tag app:test .
+        run: docker build --file Dockerfile.test --tag app:test-${{ github.run_id }} .
 
       - name: Run lint and tests
-        run: docker run --rm app:test
+        run: docker run --rm app:test-${{ github.run_id }}
 
       - name: Cleanup test image
         if: always()
-        run: docker rmi app:test || true
+        run: docker rmi app:test-${{ github.run_id }} || true
 
   build:
     name: Build & Push Docker Image
@@ -65,7 +65,7 @@ jobs:
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
-          password: ${{ secrets.registry-token || secrets.GITHUB_TOKEN }}
+          password: ${{ secrets['registry-token'] || secrets.GITHUB_TOKEN }}
 
       - name: Extract Docker metadata
         id: meta
