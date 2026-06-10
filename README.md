@@ -75,9 +75,8 @@ A simple Golang web server with an automated CI pipeline designed for enterprise
 │  • Timeout: 15 min                                                  │
 │                                                                      │
 │  Output Tags:                                                        │
-│  • main-abc1234  (Git SHA — immutable)                              │
-│  • main          (branch — mutable)                                 │
-│  • latest        (mutable, main only)                               │
+│  • main-abc1234  (Git SHA — immutable, for production/rollback)     │
+│  • main          (branch — mutable, for staging auto-deploy)        │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -96,11 +95,86 @@ A simple Golang web server with an automated CI pipeline designed for enterprise
 
 **Challenge**: 5 台 servers，每台可能同時跑 3+ jobs（共 15+ concurrent jobs）
 
+#### Runner Infrastructure Options
+
+本 pipeline 使用 `runs-on: [self-hosted, linux]`，支援以下兩種 runner 架構：
+
+**Option A: 5 台 VM 各 1 Runner（傳統架構）**
+
+```
+┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐
+│  VM 1   │ │  VM 2   │ │  VM 3   │ │  VM 4   │ │  VM 5   │
+│         │ │         │ │         │ │         │ │         │
+│ Runner  │ │ Runner  │ │ Runner  │ │ Runner  │ │ Runner  │
+│ Agent   │ │ Agent   │ │ Agent   │ │ Agent   │ │ Agent   │
+│         │ │         │ │         │ │         │ │         │
+│ Job A   │ │ Job D   │ │ Job G   │ │ Job J   │ │ Job M   │
+│ Job B   │ │ Job E   │ │ Job H   │ │ Job K   │ │ Job N   │
+│ Job C   │ │ Job F   │ │ Job I   │ │ Job L   │ │ Job O   │
+└─────────┘ └─────────┘ └─────────┘ └─────────┘ └─────────┘
+                    (每台 VM 同時跑 3+ jobs)
+```
+
+| 項目 | 說明 |
+|------|------|
+| **安裝方式** | 每台 VM 安裝 GitHub Actions Runner Agent |
+| **並行設定** | 設定 `--max-workers` 或多個 runner instance |
+| **優點** | 架構簡單、資源隔離、無單點故障 |
+| **缺點** | 固定成本、無法動態擴縮 |
+| **適合** | 穩定負載、On-premise 環境 |
+
+Runner 是持久運行的 agent，需要手動清理 Docker images 避免磁碟空間耗盡（見 workflow 中的 `Cleanup test image` step）。
+
+**Option B: Kubernetes + Actions Runner Controller（動態架構）**
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  Kubernetes Cluster (EKS / GKE / AKS / Self-managed)    │
+│                                                         │
+│  ┌─────────────────────────────────────┐                │
+│  │  Actions Runner Controller (ARC)    │ ← 監聽 job queue│
+│  │  • maxRunners: 5                    │                │
+│  │  • minRunners: 0                    │                │
+│  └──────────────────┬──────────────────┘                │
+│                     │                                   │
+│         Job 進來 → 動態建立 Runner Pod                   │
+│                     │                                   │
+│  ┌────────┐ ┌────────┐ ┌────────┐                      │
+│  │Runner  │ │Runner  │ │Runner  │  ← 臨時 Pod          │
+│  │Pod 1   │ │Pod 2   │ │Pod 3   │    Job 完成後銷毀    │
+│  └────────┘ └────────┘ └────────┘                      │
+│                                                         │
+└─────────────────────────────────────────────────────────┘
+```
+
+| 項目 | 說明 |
+|------|------|
+| **安裝方式** | 部署 ARC (actions-runner-controller) 到 K8s |
+| **並行設定** | 透過 `maxRunners` 限制為 5 |
+| **優點** | 動態擴縮、乾淨環境（Pod 銷毀後無殘留）、資源利用率高 |
+| **缺點** | 架構複雜、需要 K8s 維運能力 |
+| **適合** | 雲端環境、負載波動大、多團隊共用 |
+
+動態 Runner Pod 在 job 結束後銷毀，無需手動清理 images，但 workflow 中的 cleanup step 仍保留作為防禦性設計。
+
+**架構選擇建議**
+
+| 考量因素 | 選 Option A (VM) | 選 Option B (K8s) |
+|----------|------------------|-------------------|
+| 現有基礎設施 | 已有 VM / On-premise | 已有 K8s cluster |
+| 負載模式 | 穩定、可預測 | 波動大、尖峰明顯 |
+| 維運能力 | 熟悉 VM 管理 | 熟悉 K8s |
+| 成本考量 | 固定成本可接受 | 希望按需付費 |
+
+---
+
 **Solution A: Docker Container Isolation**
 
 每個 job 在獨立的 Docker container 中執行，process 和 filesystem 互相隔離。即使同一台 server 同時跑 3 個 jobs，也不會互相干擾或造成 state 污染，最多只是 CPU/memory 的競爭。
 
 **Solution B: Concurrency Control**
+
+定義在 `ci.yml`（caller workflow），對整個 workflow run 生效，包含其呼叫的 `go-service-ci.yml`：
 
 ```yaml
 concurrency:
@@ -142,19 +216,33 @@ concurrency:
 
 **Solution: Reusable Workflow Architecture**
 
-此 repo 的 [`.github/workflows/go-service-ci.yml`](.github/workflows/go-service-ci.yml) 即為中央 reusable workflow，其他 microservice repo 直接 `uses` 它：
+此 repo 包含兩個 workflow：
+
+- `ci.yml` — 本 repo 的 CI 入口（觸發條件、concurrency control），呼叫 `go-service-ci.yml`
+- `go-service-ci.yml` — 共用 CI 邏輯（lint、test、build、push），供所有 repo 呼叫
+
+`ci.yml` 透過相對路徑呼叫同 repo 的 reusable workflow：
+
+```yaml
+jobs:
+  ci:
+    uses: ./.github/workflows/go-service-ci.yml
+    with:
+      image-name: ${{ github.repository }}
+    secrets: inherit
+```
+
+> **實務上**，`go-service-ci.yml` 應移至獨立的 central platform repo（如 `org/ci-platform`），各 application repo 的 `ci.yml` 改為呼叫 central repo 的 workflow。本 repo 暫時存放以示範設計概念。
 
 ```
-sample-code/                               ← 此 repo（中央 workflow）
+ci-platform/                ← Central repo（實務理想架構）
 └── .github/workflows/
-    ├── ci.yml                             ← 本 repo 自己的 pipeline
-    └── go-service-ci.yml                 ← Reusable workflow（供其他 repos 呼叫）
+    └── go-service-ci.yml   ← 共用邏輯，集中維護
 
-user-service/                              ← Microservice A
-└── .github/workflows/ci.yml              ← ~15 行，呼叫 reusable workflow
-
-order-service/                             ← Microservice B
-└── .github/workflows/ci.yml              ← ~15 行，呼叫 reusable workflow
+sample-code/                ← 此 repo
+user-service/               ← Microservice A
+order-service/              ← Microservice B
+  各自 ci.yml 只需 ~15 行，呼叫 central repo 的 workflow
 ```
 
 **每個 Microservice 只需 ~15 行**:
@@ -168,7 +256,7 @@ on:
 
 jobs:
   ci:
-    uses: <org>/sample-code/.github/workflows/go-service-ci.yml@main
+    uses: <org>/ci-platform/.github/workflows/go-service-ci.yml@main
     with:
       image-name: ${{ github.repository }}
     secrets: inherit
@@ -190,26 +278,74 @@ jobs:
 |----------|---------|---------|----------|
 | **Git SHA** | `main-abc1234` | ❌ Immutable | Production deployment, rollback |
 | **Branch** | `main` | ✅ Mutable | Auto-deploy to staging |
-| **Latest** | `latest` | ✅ Mutable | Default pull target |
 
 **Why Git SHA?**
 
-`latest` 和 `main` 是 mutable 的，每次 push 都會被覆蓋，rollback 時無法知道上一個版本指向哪個 commit。Git SHA tag 是 immutable 的，出事時可以精確 rollback 到任意歷史版本。
+`main` 是 mutable 的，每次 push 都會被覆蓋，rollback 時無法知道上一個版本指向哪個 commit。Git SHA tag 是 immutable 的，出事時可以精確 rollback 到任意歷史版本。
 
-**Best Practice**:
+---
+
+**兩種 CD 策略的 Tag 選擇**
+
+Tag 的選擇應根據 CD 部署策略決定：
+
+**策略 A：固定 Tag（簡單部署）**
+
+Deployment manifest 直接寫死 mutable tag，每次 CI push 新 image 後，重啟 pod 即可拿到最新版本，無需修改任何設定：
 
 ```yaml
-# ✅ Production: 使用 immutable tags
+# deployment.yaml - 永遠拉最新的 main branch image
+image: ghcr.io/org/service:main
+```
+
+適合：小團隊、快速迭代、staging 環境自動跟版。
+
+**策略 B：GitOps（嚴謹部署）**
+
+CI build 完成後，由 GitHub Action 自動更新 config repo 裡的 manifest，將 image tag 改為 SHA，並推 commit。ArgoCD / Flux 偵測到變更後自動部署：
+
+```
+CI build → image:main-abc1234
+    │
+    ▼
+GitHub Action 更新 config repo
+  image: ghcr.io/org/service:main-abc1234  ← 從 def5678 改為 abc1234
+    │
+    ▼
+ArgoCD 偵測變更 → 自動 deploy
+```
+
+```yaml
+# 每次部署都有對應的 git commit 紀錄
+# rollback = git revert，清楚可追溯
 image: ghcr.io/org/service:main-abc1234
-
-# ❌ Production: 避免 mutable tags
-image: ghcr.io/org/service:latest
 ```
 
-**Rollback 範例**:
+適合：多環境（staging / prd 分開管理）、需要部署審計紀錄、正式生產環境。
+
+本 repo 目前同時產生 SHA 和 branch tag，兩種策略皆可支援。
+
+---
+
+**Alternative: Semantic Versioning（進階）**
+
+如果團隊有明確的 release 版本管理需求，可以改用 **git tag** 驅動 semantic version：
+
 ```bash
-kubectl set image deployment/app container=ghcr.io/org/service:main-def5678
+# 開發者打版本 tag
+git tag v1.2.3
+git push origin v1.2.3
 ```
+
+CI 偵測到 `v*` tag event 時，自動產生對應的 image tags：
+
+```
+ghcr.io/org/service:v1.2.3    ← 精確版本（immutable）
+ghcr.io/org/service:v1.2      ← minor 版本（mutable）
+ghcr.io/org/service:latest    ← 最新 release
+```
+
+此方式讓 image 版本與產品 release 直接對應，適合有正式 release 流程的團隊。本 repo 目前採用 SHA-based tagging，無需人工管理版號，適合持續交付（CD）的開發模式。
 
 ---
 
@@ -218,6 +354,8 @@ kubectl set image deployment/app container=ghcr.io/org/service:main-def5678
 **Challenge**: 安全管理 registry credentials，不在 code 或 logs 中暴露 secrets
 
 **Solution: GitHub Secrets + Least Privilege**
+
+定義在 `go-service-ci.yml` 的 build job 中：
 
 ```yaml
 permissions:
@@ -229,7 +367,7 @@ steps:
     with:
       registry: ghcr.io
       username: ${{ github.actor }}
-      password: ${{ secrets.GITHUB_TOKEN }}  # Auto-provided, 無需手動設定
+      password: ${{ secrets['registry-token'] || secrets.GITHUB_TOKEN }}
 ```
 
 `GITHUB_TOKEN` 由 GitHub 自動產生，每次 workflow run 都是新 token，無 long-lived credentials 風險。
@@ -284,8 +422,8 @@ docker run -p 8080:8080 simple-go-server
 ```
 .
 ├── .github/workflows/
-│   ├── ci.yml                      # CI pipeline (本 repo)
-│   └── go-service-ci.yml           # Reusable workflow (供其他 repos 呼叫)
+│   ├── ci.yml                      # CI 入口：觸發條件 & concurrency control，呼叫 go-service-ci.yml
+│   └── go-service-ci.yml           # Reusable workflow：lint、test、build、push 邏輯
 ├── Dockerfile                      # Production multi-stage build
 ├── Dockerfile.test                 # Testing/linting environment
 ├── .golangci.yml                   # Linting configuration

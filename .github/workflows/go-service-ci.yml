@@ -1,7 +1,11 @@
 name: Reusable Go Service CI
 
+# Called within this repo:
+#   uses: ./.github/workflows/go-service-ci.yml
+#
 # Called by other microservice repositories via:
-#   uses: <org>/sample-code/.github/workflows/go-service-ci.yml@main
+#   uses: <org>/ci-platform/.github/workflows/go-service-ci.yml@main
+#   (In production, move this file to a dedicated central platform repo)
 on:
   workflow_call:
     inputs:
@@ -15,7 +19,7 @@ on:
         required: true
     secrets:
       registry-token:
-        description: Token for registry login (defaults to GITHUB_TOKEN if not provided)
+        description: Token for registry login. If not provided, GITHUB_TOKEN is used (suitable for ghcr.io).
         required: false
 
 env:
@@ -75,7 +79,6 @@ jobs:
           tags: |
             type=sha,prefix={{branch}}-,format=short
             type=ref,event=branch
-            type=raw,value=latest,enable={{is_default_branch}}
           flavor: |
             latest=false
 
